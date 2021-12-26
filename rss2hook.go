@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha1"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -37,6 +38,24 @@ type RSSEntry struct {
 	hook string
 }
 
+type Props struct {
+	DeliveryMode int `json:"delivery_mode"`
+}
+
+type Payload struct {
+	RSSItem *gofeed.Item `json:"item"`
+	Source string `json:"source"`
+}
+
+type AMQP_Payload struct {
+	Vhost   string `json:"vhost"`
+	Name    string `json:"name"`
+	RoutingKey string `json:"routing_key"`
+	Properties Props `json:"properties"`
+	Payload string `json:"payload"`
+	Enc string `json:"payload_encoding"`
+}
+
 // Loaded contains the loaded feeds + hooks, as read from the specified
 // configuration file
 var Loaded []RSSEntry
@@ -44,6 +63,13 @@ var Loaded []RSSEntry
 // Timeout is the (global) timeout we use when loading remote RSS
 // feeds.
 var Timeout time.Duration
+
+// Directory for storing seen items
+var Seendir string
+var Queuename string
+var AMQPAccount string
+var HTTPUsername string
+var HTTPPassword string
 
 // loadConfig loads the named configuration file and populates our
 // `Loaded` list of RSS-feeds & Webhook addresses
@@ -136,7 +162,7 @@ func isNew(parent string, item *gofeed.Item) bool {
 	// Hexadecimal conversion
 	hexSha1 := hex.EncodeToString(hashBytes)
 
-	if _, err := os.Stat(os.Getenv("HOME") + "/.rss2hook/seen/" + hexSha1); os.IsNotExist(err) {
+	if _, err := os.Stat(Seendir + hexSha1); os.IsNotExist(err) {
 		return true
 	}
 	return false
@@ -153,7 +179,7 @@ func recordSeen(parent string, item *gofeed.Item) {
 	// Hexadecimal conversion
 	hexSha1 := hex.EncodeToString(hashBytes)
 
-	dir := os.Getenv("HOME") + "/.rss2hook/seen"
+	dir := Seendir
 	os.MkdirAll(dir, os.ModePerm)
 
 	_ = ioutil.WriteFile(dir+"/"+hexSha1, []byte(item.Link), 0644)
@@ -165,7 +191,7 @@ func recordSeen(parent string, item *gofeed.Item) {
 // For each available feed it looks for new entries, and when founds
 // triggers `notify` upon the resulting entry
 func checkFeeds() {
-
+	client := &http.Client{}
 	//
 	// For each thing we're monitoring
 	//
@@ -195,7 +221,7 @@ func checkFeeds() {
 			if isNew(monitor.feed, i) {
 
 				// Trigger the notification
-				err := notify(monitor.hook, i)
+				err := notify(client, monitor.feed, monitor.hook, i)
 
 				// and if that notification succeeded
 				// then record this item as having been
@@ -211,11 +237,28 @@ func checkFeeds() {
 // notify actually submits the specified item to the remote webhook.
 //
 // The RSS-item is submitted as a JSON-object.
-func notify(hook string, item *gofeed.Item) error {
+func notify(client *http.Client, feed string, hook string, item *gofeed.Item) error {
+	
+	// new AMQP_Payload 
+	properties := Props{1}
+	payload := Payload{
+		item,
+		feed,
+	}
+	// payload to json string
+	jsonPayload, err := json.Marshal(payload)
+	amqp_payload := AMQP_Payload{
+		AMQPAccount, 
+		"amq.default",
+		Queuename, 
+		properties,
+		string(jsonPayload),
+		"string",
+	}
 
 	// We'll post the item as a JSON object.
 	// So first of all encode it.
-	jsonValue, err := json.Marshal(item)
+	jsonValue, err := json.Marshal(amqp_payload)
 	if err != nil {
 		fmt.Printf("notify: Failed to encode JSON:%s\n", err.Error())
 		return err
@@ -224,10 +267,14 @@ func notify(hook string, item *gofeed.Item) error {
 	//
 	// Post to the specified hook URL.
 	//
-	res, err := http.Post(hook,
-		"application/json",
-		bytes.NewBuffer(jsonValue))
-
+	req, err := http.NewRequest("POST", hook, bytes.NewBuffer(jsonValue))
+	// ...
+	req.Header.Add("Content-Type", `application/json`)
+	// if HTTPPassword or HTTPUsername are set, add them to the request
+	if HTTPPassword != "" || HTTPUsername != "" {
+		req.Header.Add("Authorization", `Basic ` + base64.StdEncoding.EncodeToString([]byte(HTTPUsername+":"+HTTPPassword)))
+	}
+	res, err := client.Do(req)
 	if err != nil {
 		fmt.Printf("notify: Failed to POST to %s - %s\n",
 			hook, err.Error())
@@ -257,12 +304,22 @@ func notify(hook string, item *gofeed.Item) error {
 func main() {
 
 	// Parse the command-line flags
-	config := flag.String("config", "", "The path to the configuration-file to read")
+	config := flag.String("config", "./rss.cfg", "The path to the configuration-file to read")
+	seendir := flag.String("seendir", os.Getenv("HOME") + "/.rss2hook/seen/", "Path to thee Directory to store seen-items")
+	queuename := flag.String("queuename", "", "The name of the queue to publish to")
+	amqpaccount := flag.String("amqpaccount", "", "The name of the account to use for AMQP")
+	httpusername := flag.String("username", "", "Username for HTTP Basic Auth")
+	httppassword := flag.String("password", "", "Password for HTTP Basic Auth")
 	timeout := flag.Duration("timeout", 5*time.Second, "The timeout used for fetching the remote feeds")
 	flag.Parse()
 
 	// Setup the default timeout.
 	Timeout = *timeout
+	Seendir = *seendir
+	Queuename = *queuename
+	AMQPAccount = *amqpaccount
+	HTTPUsername = *httpusername
+	HTTPPassword = *httppassword
 
 	if *config == "" {
 		fmt.Printf("Please specify a configuration-file to read\n")
